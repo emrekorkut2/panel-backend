@@ -197,6 +197,11 @@ def init_db():
                         (uid, "default-device", token_hash, datetime.utcnow().isoformat()))
             creds.append((uname, pwd, token_plain))
 
+        print("\n[BOOT INFO] 10 kullanıcı + cihaz tokenları (yalnızca bu logda görünür):")
+        for u, p, t in creds:
+            print(f"  - {u}  |  password: {p}  |  device-token: {t}")
+        print("İlk girişte kullanıcı onboarding’e yönlendirilir; e-posta doğrulamadan devam edemez.\n")
+
     con.commit(); con.close()
 
 init_db()
