@@ -1,3 +1,4 @@
+# server.py
 import os
 import sqlite3
 import mimetypes
@@ -29,7 +30,7 @@ TEMPLATE_DIR.mkdir(exist_ok=True)
 SECRET_KEY    = os.environ.get("APP_SECRET", secrets.token_hex(32))
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 
-# SMTP (e-posta) — zorunlu
+# SMTP (e-posta) — zorunlu (onboarding & reset için)
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
@@ -37,12 +38,20 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", "")
 SMTP_STARTTLS = os.environ.get("SMTP_STARTTLS", "1") == "1"
 
-# Dev/test için: sabit bir token
+# Dev/test: sabit token (opsiyonel)
 DEV_GLOBAL_MEDIA_TOKEN = os.environ.get("MEDIA_TOKEN", "")
 
 # ================== App & Security ==================
-app = FastAPI(title="Media Panel — Single Tenant (10 users, onboarding + email verify + forgot password)")
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax", https_only=False)
+app = FastAPI(title="Media Panel — Single Tenant")
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    session_cookie="mediacast_sid",
+    same_site="lax",      # iframe kullanıyorsan "none" yap + https_only True kalsın
+    https_only=True,      # Railway/HTTPS’te zorunlu
+    max_age=60*60*24*30,  # 30 gün
+    path="/",
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
@@ -75,14 +84,10 @@ def send_email(to_addr: str, subject: str, body: str):
     msg.set_content(body)
     if SMTP_STARTTLS:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
+            s.ehlo(); s.starttls(); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
     else:
         with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
+            s.login(SMTP_USER, SMTP_PASS); s.send_message(msg)
 
 # ================== DB ==================
 def db_conn():
@@ -113,11 +118,7 @@ def init_db():
             created_at TEXT NOT NULL
         );
     """)
-
-    # Add missing columns for backwards compatibility
-    for t, cols in {
-        "users": ["first_name","last_name","country","email","email_verified","first_login_completed"]
-    }.items():
+    for t, cols in {"users": ["first_name","last_name","country","email","email_verified","first_login_completed"]}.items():
         for c in cols:
             if not column_exists(cur, t, c):
                 if c in ("email_verified","first_login_completed"):
@@ -125,7 +126,7 @@ def init_db():
                 else:
                     cur.execute(f"ALTER TABLE {t} ADD COLUMN {c} TEXT;")
 
-    # Onboarding & reset codes
+    # Verify/reset codes
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,7 +139,7 @@ def init_db():
         );
     """)
 
-    # Per-user playback config
+    # Config
     cur.execute("""
         CREATE TABLE IF NOT EXISTS config (
             user_id INTEGER PRIMARY KEY,
@@ -150,7 +151,7 @@ def init_db():
         );
     """)
 
-    # Per-user media library
+    # Media
     cur.execute("""
         CREATE TABLE IF NOT EXISTS media (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,19 +164,19 @@ def init_db():
         );
     """)
 
-    # One device (token) per user
+    # Device token (one per user)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS api_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE NOT NULL,   -- her kullanıcıya tek cihaz
+            user_id INTEGER UNIQUE NOT NULL,
             name TEXT NOT NULL,
-            token_hash TEXT NOT NULL,          -- SHA-256
+            token_hash TEXT NOT NULL,
             created_at TEXT NOT NULL,
             last_used_at TEXT
         );
     """)
 
-    # İlk kurulumda 10 kullanıcı & token oluştur
+    # Seed: 10 users + token
     cur.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
         creds = []
@@ -187,9 +188,7 @@ def init_db():
             cur.execute("INSERT INTO users(username, password_hash, created_at) VALUES (?,?,?)",
                         (uname, pwd_hash, datetime.utcnow().isoformat()))
             uid = cur.lastrowid
-            # default config
             cur.execute("INSERT OR IGNORE INTO config(user_id) VALUES (?)", (uid,))
-            # device token (tek)
             token_plain = secrets.token_urlsafe(24)
             token_hash  = hashlib.sha256(token_plain.encode()).hexdigest()
             cur.execute("""INSERT INTO api_tokens(user_id, name, token_hash, created_at)
@@ -200,7 +199,7 @@ def init_db():
         print("\n[BOOT INFO] 10 kullanıcı + cihaz tokenları (yalnızca bu logda görünür):")
         for u, p, t in creds:
             print(f"  - {u}  |  password: {p}  |  device-token: {t}")
-        print("İlk girişte kullanıcı onboarding’e yönlendirilir; e-posta doğrulamadan devam edemez.\n")
+        print("İlk girişte onboarding → e-posta doğrulama yapılır.\n")
 
     con.commit(); con.close()
 
@@ -267,18 +266,15 @@ def verify_code(user_id: int, purpose: str, code: str) -> bool:
     if row:
         if datetime.utcnow() <= datetime.fromisoformat(row["expires_at"]):
             ok = hashlib.sha256(code.encode()).hexdigest() == row["code_hash"]
-        # tek kullanımlık
-        cur.execute("DELETE FROM user_codes WHERE id=?", (row["id"],))
+        cur.execute("DELETE FROM user_codes WHERE id=?", (row["id"],))  # tek kullanımlık
         con.commit()
     con.close()
     return ok
 
 # ================== Templates (ilk çalıştırmada yaz) ==================
 LAYOUT_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1" />
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{{ title or 'Control Panel' }}</title>
 <style>
 :root{--bg:#0b1020;--fg:#e6edf3;--mut:#9aa4b2;--card:#0f172a;--line:#1f2a44;--soft:#0d1b2a;--acc:#22d3ee}
@@ -293,209 +289,193 @@ table{width:100%;border-collapse:collapse}
 th,td{border-bottom:1px solid var(--line);padding:10px;text-align:left}
 .mut{color:var(--mut)}
 .right{margin-left:auto}
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <h2 style="margin:0 0 12px">{{ title or 'Control Panel' }}</h2>
-    {% block content %}{% endblock %}
-  </div>
-</body>
-</html>
+</style></head><body><div class="wrap">
+<h2 style="margin:0 0 12px">{{ title or 'Control Panel' }}</h2>
+{% block content %}{% endblock %}
+</div></body></html>
 """
 
 LOGIN_HTML = """
-{% extends 'layout.html' %}
-{% block content %}
-  <div class="card">
-    <form method="post" action="/login" class="row">
-      <div>
-        <div>Username</div>
-        <input name="username" required />
-      </div>
-      <div>
-        <div>Password</div>
-        <input type="password" name="password" required />
-      </div>
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <div style="align-self:flex-end"><button>Sign in</button></div>
-    </form>
-    <p class="mut"><a href="/forgot">Forgot your password?</a></p>
-  </div>
+{% extends 'layout.html' %}{% block content %}
+<div class="card">
+  <h3>Sign in</h3>
+  <form method="post" action="/login" class="row">
+    <div><div>Username</div><input name="username" required /></div>
+    <div><div>Password</div><input type="password" name="password" required /></div>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <div style="align-self:flex-end"><button>Sign in</button></div>
+  </form>
+  <p class="mut"><a href="/forgot">Forgot your password?</a></p>
+</div>
 {% endblock %}
 """
 
 ONBOARD_HTML = """
-{% extends 'layout.html' %}
-{% block content %}
-  <div class="card">
-    <h3>Complete your profile (first time)</h3>
-    <form method="post" action="/onboarding" class="row">
-      <input type="text" name="first_name" placeholder="First name" required />
-      <input type="text" name="last_name"  placeholder="Last name" required />
-      <input type="text" name="country"    placeholder="Country" required />
-      <input type="email" name="email"     placeholder="E-mail" required />
-      <input type="password" name="new_password" placeholder="New password" required />
-      <input type="password" name="new_password2" placeholder="Confirm password" required />
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Save & Send verification code</button>
-    </form>
-    <p class="mut">We sent a 6-digit code to your e-mail. Enter it on the next screen.</p>
-  </div>
+{% extends 'layout.html' %}{% block content %}
+<div class="card">
+  <h3>Complete your profile (first time)</h3>
+  <form method="post" action="/onboarding" class="row">
+    <input type="text" name="first_name" placeholder="First name" required />
+    <input type="text" name="last_name"  placeholder="Last name" required />
+    <input type="text" name="country"    placeholder="Country" required />
+    <input type="email" name="email"     placeholder="E-mail" required />
+    <input type="password" name="new_password"  placeholder="New password" required />
+    <input type="password" name="new_password2" placeholder="Confirm password" required />
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Save & Send verification code</button>
+  </form>
+  <p class="mut">We sent a 6-digit code to your e-mail. Enter it on the next screen.</p>
+</div>
 {% endblock %}
 """
 
 VERIFY_HTML = """
-{% extends 'layout.html' %}
-{% block content %}
-  <div class="card">
-    <h3>E-mail verification</h3>
-    <form method="post" action="/verify" class="row">
-      <input type="hidden" name="u" value="{{ username }}" />
-      <input type="text" name="code" placeholder="6-digit code" pattern="\\d{6}" required />
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Verify</button>
-    </form>
-    <form method="post" action="/verify/resend" class="row">
-      <input type="hidden" name="u" value="{{ username }}" />
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Resend code</button>
-    </form>
-  </div>
+{% extends 'layout.html' %}{% block content %}
+<div class="card">
+  <h3>E-mail verification</h3>
+  <form method="post" action="/verify" class="row">
+    <input type="hidden" name="u" value="{{ username }}" />
+    <input type="text" name="code" placeholder="6-digit code" pattern="\\d{6}" required />
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Verify</button>
+  </form>
+  <form method="post" action="/verify/resend" class="row">
+    <input type="hidden" name="u" value="{{ username }}" />
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Resend code</button>
+  </form>
+</div>
 {% endblock %}
 """
 
 FORGOT_HTML = """
-{% extends 'layout.html' %}
-{% block content %}
-  <div class="card">
-    <h3>Reset password</h3>
-    <form method="post" action="/forgot" class="row">
-      <input type="text"   name="username" placeholder="Username" required />
-      <input type="email"  name="email" placeholder="E-mail on file" required />
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Send reset code</button>
-    </form>
-  </div>
+{% extends 'layout.html' %}{% block content %}
+<div class="card">
+  <h3>Reset password</h3>
+  <form method="post" action="/forgot" class="row">
+    <input type="text"  name="username" placeholder="Username" required />
+    <input type="email" name="email"    placeholder="E-mail on file" required />
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Send reset code</button>
+  </form>
+</div>
 {% endblock %}
 """
 
 RESET_HTML = """
-{% extends 'layout.html' %}
-{% block content %}
-  <div class="card">
-    <h3>Enter reset code</h3>
-    <form method="post" action="/reset" class="row">
-      <input type="hidden" name="u" value="{{ username }}" />
-      <input type="text" name="code" placeholder="6-digit code" pattern="\\d{6}" required />
-      <input type="password" name="new_password" placeholder="New password" required />
-      <input type="password" name="new_password2" placeholder="Confirm new password" required />
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Change password</button>
-    </form>
-  </div>
+{% extends 'layout.html' %}{% block content %}
+<div class="card">
+  <h3>Enter reset code</h3>
+  <form method="post" action="/reset" class="row">
+    <input type="hidden" name="u" value="{{ username }}" />
+    <input type="text" name="code" placeholder="6-digit code" pattern="\\d{6}" required />
+    <input type="password" name="new_password"  placeholder="New password" required />
+    <input type="password" name="new_password2" placeholder="Confirm new password" required />
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Change password</button>
+  </form>
+</div>
 {% endblock %}
 """
 
 INDEX_HTML = """
-{% extends 'layout.html' %}
-{% block content %}
-  <div class="card" style="display:flex;justify-content:space-between;align-items:center">
-    <div>Hello, <strong>{{ user.username }}</strong></div>
-    <div class="row">
-      <form method="post" action="/logout">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-        <button>Logout</button>
-      </form>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>Change Password</h3>
-    <form method="post" action="/change_password" class="row">
-      <input type="password" name="old_password" placeholder="Current password" required />
-      <input type="password" name="new_password" placeholder="New password" required />
+{% extends 'layout.html' %}{% block content %}
+<div class="card" style="display:flex;justify-content:space-between;align-items:center">
+  <div>Hello, <strong>{{ user.username }}</strong></div>
+  <div class="row">
+    <form method="post" action="/logout">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Update</button>
+      <button>Logout</button>
     </form>
   </div>
+</div>
 
-  <div class="card">
-    <h3>Upload Media (Photo/Video)</h3>
-    <form method="post" action="/upload" enctype="multipart/form-data" class="row">
-      <input type="file" name="files" accept="image/*,video/*" multiple required />
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Upload</button>
-    </form>
-    <p class="mut">Your device (token) will fetch only your own media.</p>
-  </div>
+<div class="card">
+  <h3>Change Password</h3>
+  <form method="post" action="/change_password" class="row">
+    <input type="password" name="old_password" placeholder="Current password" required />
+    <input type="password" name="new_password" placeholder="New password" required />
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Update</button>
+  </form>
+</div>
 
-  <div class="card">
-    <h3>Playback Settings</h3>
-    <form method="post" action="/config" class="row">
-      <label>Loop all
-        <select name="loop_all">
-          <option value="1" {% if cfg.loop_all %}selected{% endif %}>On</option>
-          <option value="0" {% if not cfg.loop_all %}selected{% endif %}>Off</option>
-        </select>
-      </label>
-      <label>Shuffle
-        <select name="shuffle">
-          <option value="0" {% if not cfg.shuffle %}selected{% endif %}>Off</option>
-          <option value="1" {% if cfg.shuffle %}selected{% endif %}>On</option>
-        </select>
-      </label>
-      <label>Image seconds
-        <input type="number" min="1" name="image_duration" value="{{ cfg.image_duration }}" />
-      </label>
-      <label>Video repeats
-        <input type="number" min="1" name="video_repeats" value="{{ cfg.video_repeats }}" />
-      </label>
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Save</button>
-    </form>
-  </div>
+<div class="card">
+  <h3>Upload Media (Photo/Video)</h3>
+  <form method="post" action="/upload" enctype="multipart/form-data" class="row">
+    <input type="file" name="files" accept="image/*,video/*" multiple required />
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Upload</button>
+  </form>
+  <p class="mut">Your device (token) will fetch only your own media.</p>
+</div>
 
-  <div class="card">
-    <h3>Device Token</h3>
-    <form method="post" action="/token/reset" class="row">
-      <span class="mut">Each user has exactly one device token.</span>
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-      <button>Reset token (show once)</button>
-    </form>
-    <table>
-      <thead><tr><th>Name</th><th>Created</th><th>Last used</th></tr></thead>
-      <tbody>
-        {% if token %}
-        <tr><td>{{ token.name }}</td><td class="mut">{{ token.created_at }}</td><td class="mut">{{ token.last_used_at or '-' }}</td></tr>
-        {% endif %}
-      </tbody>
-    </table>
-  </div>
+<div class="card">
+  <h3>Playback Settings</h3>
+  <form method="post" action="/config" class="row">
+    <label>Loop all
+      <select name="loop_all">
+        <option value="1" {% if cfg.loop_all %}selected{% endif %}>On</option>
+        <option value="0" {% if not cfg.loop_all %}selected{% endif %}>Off</option>
+      </select>
+    </label>
+    <label>Shuffle
+      <select name="shuffle">
+        <option value="0" {% if not cfg.shuffle %}selected{% endif %}>Off</option>
+        <option value="1" {% if cfg.shuffle %}selected{% endif %}>On</option>
+      </select>
+    </label>
+    <label>Image seconds
+      <input type="number" min="1" name="image_duration" value="{{ cfg.image_duration }}" />
+    </label>
+    <label>Video repeats
+      <input type="number" min="1" name="video_repeats" value="{{ cfg.video_repeats }}" />
+    </label>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Save</button>
+  </form>
+</div>
 
-  <div class="card">
-    <h3>Your Media</h3>
-    <table>
-      <thead><tr><th>ID</th><th>Preview</th><th>Type</th><th>Name</th><th>Date</th></tr></thead>
-      <tbody>
-      {% for m in media %}
-        <tr>
-          <td>{{ m.id }}</td>
-          <td>
-            {% if m.media_type == 'image' %}
-              <img src="/panel/media/{{ m.filename }}" style="height:56px;border-radius:8px" />
-            {% else %}
-              <video src="/panel/media/{{ m.filename }}" style="height:56px;border-radius:8px" muted></video>
-            {% endif %}
-          </td>
-          <td>{{ m.media_type }}</td>
-          <td class="mut">{{ m.original_name }}</td>
-          <td class="mut">{{ m.uploaded_at }}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
+<div class="card">
+  <h3>Device Token</h3>
+  <form method="post" action="/token/reset" class="row">
+    <span class="mut">Each user has exactly one device token.</span>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <button>Reset token (show once)</button>
+  </form>
+  <table>
+    <thead><tr><th>Name</th><th>Created</th><th>Last used</th></tr></thead>
+    <tbody>
+      {% if token %}
+      <tr><td>{{ token.name }}</td><td class="mut">{{ token.created_at }}</td><td class="mut">{{ token.last_used_at or '-' }}</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h3>Your Media</h3>
+  <table>
+    <thead><tr><th>ID</th><th>Preview</th><th>Type</th><th>Name</th><th>Date</th></tr></thead>
+    <tbody>
+    {% for m in media %}
+      <tr>
+        <td>{{ m.id }}</td>
+        <td>
+          {% if m.media_type == 'image' %}
+            <img src="/panel/media/{{ m.filename }}" style="height:56px;border-radius:8px" />
+          {% else %}
+            <video src="/panel/media/{{ m.filename }}" style="height:56px;border-radius:8px" muted></video>
+          {% endif %}
+        </td>
+        <td>{{ m.media_type }}</td>
+        <td class="mut">{{ m.original_name }}</td>
+        <td class="mut">{{ m.uploaded_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
 {% endblock %}
 """
 
@@ -530,7 +510,7 @@ async def home(request: Request):
         csrf_token = get_or_set_csrf(request)
         return templates.TemplateResponse("login.html", {"request": request, "title": "Sign in", "csrf_token": csrf_token})
 
-    # İlk giriş tamamlanmadıysa onboarding/verify akışına yönlendir
+    # onboarding/verify bitmeden panele alınmaz
     if not (user["first_login_completed"] and user["email_verified"]):
         return RedirectResponse(url="/onboarding", status_code=302)
 
@@ -551,6 +531,11 @@ async def home(request: Request):
 
     csrf_token = get_or_set_csrf(request)
     return templates.TemplateResponse("index.html", {"request": request, "user": user, "media": media, "cfg": cfg, "token": tok, "csrf_token": csrf_token, "title": "Control Panel"})
+
+# ---- Debug: session kontrol
+@app.get("/whoami")
+def whoami(request: Request):
+    return {"session": dict(request.session)}
 
 # ---- Auth ----
 @app.post("/login")
@@ -589,19 +574,18 @@ async def onboarding_post(request: Request,
     if new_password != new_password2:
         return RedirectResponse("/onboarding", 302)
     con = db_conn(); cur = con.cursor()
-    cur.execute("""UPDATE users SET first_name=?, last_name=?, country=?, email=?, 
+    cur.execute("""UPDATE users SET first_name=?, last_name=?, country=?, email=?,
                    password_hash=?, first_login_completed=1 WHERE id=?""",
                 (first_name.strip(), last_name.strip(), country.strip(), email.strip(),
                  PWD_CTX.hash(new_password), user["id"]))
     con.commit(); con.close()
 
-    # send verify code
     code = new_code(user["id"], "verify", minutes=15)
     try:
-        send_email(email.strip(), "Your verification code", f"Your verification code is: {code}\nThis code expires in 15 minutes.")
+        send_email(email.strip(), "Your verification code",
+                   f"Your verification code is: {code}\nThis code expires in 15 minutes.")
     except Exception as e:
         print("EMAIL ERROR:", e)
-        # E-posta hatasında yine de verify sayfasına yönlendir
     csrf = get_or_set_csrf(request)
     return templates.TemplateResponse("verify.html", {"request": request, "csrf_token": csrf, "username": user["username"], "title": "Verify"})
 
@@ -623,16 +607,16 @@ async def verify_resend(request: Request, u: str = Form(...), csrf_token: str = 
     user = require_login(request); ensure_csrf(request, csrf_token)
     if user["username"] != u:
         return RedirectResponse("/onboarding", 302)
-    # resend
     con = db_conn(); cur = con.cursor()
     cur.execute("SELECT email FROM users WHERE id=?", (user["id"],))
-    email = (cur.fetchone() or {}).get("email") if hasattr(cur.fetchone(), "get") else None
-    con.close()
+    row = cur.fetchone(); con.close()
+    email = row["email"] if row else None
     if not email:
         return RedirectResponse("/onboarding", 302)
     code = new_code(user["id"], "verify", minutes=15)
     try:
-        send_email(email, "Your verification code", f"Your verification code is: {code}\nThis code expires in 15 minutes.")
+        send_email(email, "Your verification code",
+                   f"Your verification code is: {code}\nThis code expires in 15 minutes.")
     except Exception as e:
         print("EMAIL ERROR:", e)
     return RedirectResponse("/onboarding", 302)
@@ -654,7 +638,8 @@ async def forgot_post(request: Request, username: str = Form(...), email: str = 
     uid = int(row["id"])
     code = new_code(uid, "reset", minutes=15)
     try:
-        send_email(email.strip(), "Password reset code", f"Your reset code is: {code}\nThis code expires in 15 minutes.")
+        send_email(email.strip(), "Password reset code",
+                   f"Your reset code is: {code}\nThis code expires in 15 minutes.")
     except Exception as e:
         print("EMAIL ERROR:", e)
     con.close()
@@ -744,7 +729,6 @@ async def reset_token(request: Request, csrf_token: str = Form("")):
     token_plain = secrets.token_urlsafe(24)
     token_hash  = hashlib.sha256(token_plain.encode()).hexdigest()
     con = db_conn(); cur = con.cursor()
-    # unique user_id → var ise güncelle, yoksa oluştur
     cur.execute("SELECT 1 FROM api_tokens WHERE user_id=?", (user["id"],))
     if cur.fetchone():
         cur.execute("UPDATE api_tokens SET token_hash=?, created_at=?, last_used_at=NULL WHERE user_id=?",
@@ -756,7 +740,7 @@ async def reset_token(request: Request, csrf_token: str = Form("")):
     con.commit(); con.close()
     return PlainTextResponse(f"NEW DEVICE TOKEN (show once):\n{token_plain}")
 
-# ---- Panel içi medya görüntüleme (login gerekli) ----
+# ---- Panel içi medya (login gerekli)
 @app.get("/panel/media/{filename}")
 async def panel_media(filename: str, request: Request):
     user = require_login(request)
@@ -775,8 +759,7 @@ def _auth_bearer(request: Request) -> int:
         raise HTTPException(status_code=401, detail="token required")
     token = auth[7:].strip()
     uid = token_to_user_id(token)
-    if not uid:
-        raise HTTPException(status_code=401, detail="invalid token")
+    if not uid: raise HTTPException(status_code=401, detail="invalid token")
     return uid
 
 @app.get("/api/playlist")
@@ -815,7 +798,7 @@ async def api_media(filename: str, request: Request):
 async def health():
     return {"ok": True}
 
-# ================== Bootstrap templates if missing ==================
+# ================== Template bootstrap (eksikse yaz) ==================
 for name, content in {
     "layout.html": LAYOUT_HTML,
     "login.html": LOGIN_HTML,
