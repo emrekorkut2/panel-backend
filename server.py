@@ -6,18 +6,23 @@ import secrets
 import uuid
 import hashlib
 import smtplib
+import base64
 from email.message import EmailMessage
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import Response
 from passlib.context import CryptContext
+
+# crypto
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ================== Paths & Config ==================
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,9 +33,10 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 TEMPLATE_DIR.mkdir(exist_ok=True)
 
 SECRET_KEY    = os.environ.get("APP_SECRET", secrets.token_hex(32))
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))   # upload boyut sınırı (MB)
+MAX_DECRYPT_MB = int(os.environ.get("MAX_DECRYPT_MB", "300")) # RAM'de çözme sınırı (MB)
 
-# SMTP (e-posta) — zorunlu (onboarding & reset için)
+# SMTP (e-posta) — onboarding & reset için
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
@@ -38,17 +44,20 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", "")
 SMTP_STARTTLS = os.environ.get("SMTP_STARTTLS", "1") == "1"
 
-# Dev/test: sabit token (opsiyonel)
+# Demo seed kontrolü (prod'da 0 yap)
+SEED_DEMO = os.environ.get("SEED_DEMO", "1") == "1"
+
+# Dev/test: sabit device token (opsiyonel)
 DEV_GLOBAL_MEDIA_TOKEN = os.environ.get("MEDIA_TOKEN", "")
 
 # ================== App & Security ==================
-app = FastAPI(title="Media Panel — Single Tenant")
+app = FastAPI(title="Media Panel — Single Tenant (Encrypted)")
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
     session_cookie="mediacast_sid",
-    same_site="lax",      # iframe kullanıyorsan "none" yap + https_only True kalsın
-    https_only=True,      # Railway/HTTPS’te zorunlu
+    same_site="lax",      # iframe içinde kullanacaksan "none" yap + https_only True kalsın
+    https_only=True,      # Railway/HTTPS
     max_age=60*60*24*30,  # 30 gün
     path="/",
 )
@@ -71,12 +80,12 @@ def guess_media_type(filename: str) -> str:
     mt, _ = mimetypes.guess_type(filename)
     if mt and mt.startswith("image/"): return "image"
     if mt and mt.startswith("video/"): return "video"
-    return "image"
+    return "application/octet-stream"
 
 # ================== Email ==================
 def send_email(to_addr: str, subject: str, body: str):
     if not (SMTP_HOST and SMTP_FROM and to_addr):
-        raise RuntimeError("SMTP env vars missing")
+        raise RuntimeError("SMTP env yok: SMTP_HOST/PORT/USER/PASS/FROM")
     msg = EmailMessage()
     msg["From"] = SMTP_FROM
     msg["To"]   = to_addr
@@ -151,7 +160,7 @@ def init_db():
         );
     """)
 
-    # Media
+    # Media (dosyalar şifreli; filename'de uzantı korunur)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS media (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,34 +185,64 @@ def init_db():
         );
     """)
 
-    # Seed: 10 users + token
-    cur.execute("SELECT COUNT(*) FROM users")
-    if cur.fetchone()[0] == 0:
-        creds = []
-        for i in range(1, 11):
-            uname = f"user{i:02d}"
-            alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-            pwd = "".join(secrets.choice(alphabet) for _ in range(10))
-            pwd_hash = PWD_CTX.hash(pwd)
-            cur.execute("INSERT INTO users(username, password_hash, created_at) VALUES (?,?,?)",
-                        (uname, pwd_hash, datetime.utcnow().isoformat()))
-            uid = cur.lastrowid
-            cur.execute("INSERT OR IGNORE INTO config(user_id) VALUES (?)", (uid,))
-            token_plain = secrets.token_urlsafe(24)
-            token_hash  = hashlib.sha256(token_plain.encode()).hexdigest()
-            cur.execute("""INSERT INTO api_tokens(user_id, name, token_hash, created_at)
-                           VALUES (?,?,?,?)""",
-                        (uid, "default-device", token_hash, datetime.utcnow().isoformat()))
-            creds.append((uname, pwd, token_plain))
+    # Seed: 10 users + token (sadece SEED_DEMO=1 ise)
+    if SEED_DEMO:
+        cur.execute("SELECT COUNT(*) FROM users")
+        if cur.fetchone()[0] == 0:
+            creds = []
+            for i in range(1, 11):
+                uname = f"user{i:02d}"
+                alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+                pwd = "".join(secrets.choice(alphabet) for _ in range(10))
+                pwd_hash = PWD_CTX.hash(pwd)
+                cur.execute("INSERT INTO users(username, password_hash, created_at) VALUES (?,?,?)",
+                            (uname, pwd_hash, datetime.utcnow().isoformat()))
+                uid = cur.lastrowid
+                cur.execute("INSERT OR IGNORE INTO config(user_id) VALUES (?)", (uid,))
+                token_plain = secrets.token_urlsafe(24)
+                token_hash  = hashlib.sha256(token_plain.encode()).hexdigest()
+                cur.execute("""INSERT INTO api_tokens(user_id, name, token_hash, created_at)
+                               VALUES (?,?,?,?)""",
+                            (uid, "default-device", token_hash, datetime.utcnow().isoformat()))
+                creds.append((uname, pwd, token_plain))
 
-        print("\n[BOOT INFO] 10 kullanıcı + cihaz tokenları (yalnızca bu logda görünür):")
-        for u, p, t in creds:
-            print(f"  - {u}  |  password: {p}  |  device-token: {t}")
-        print("İlk girişte onboarding → e-posta doğrulama yapılır.\n")
+            print("\n[BOOT INFO] 10 kullanıcı + cihaz tokenları (sadece bu logda görünür):")
+            for u, p, t in creds:
+                print(f"  - {u}  |  password: {p}  |  device-token: {t}")
+            print("İlk girişte onboarding → e-posta doğrulama yapılır.\n")
 
     con.commit(); con.close()
 
 init_db()
+
+# ================== Encryption Helpers ==================
+def get_master_key() -> bytes:
+    key_b64 = os.environ.get("MASTER_KEY", "")
+    if not key_b64:
+        raise RuntimeError("MASTER_KEY env yok (32-byte base64).")
+    try:
+        return base64.urlsafe_b64decode(key_b64)
+    except Exception as e:
+        raise RuntimeError("MASTER_KEY base64 decode edilemedi") from e
+
+def get_user_media_key(user_id: int) -> bytes:
+    # Per-user anahtar: MASTER_KEY’ten HKDF ile türetilir (saklanmaz)
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32,
+                salt=f"user:{user_id}".encode(), info=b"media-key")
+    return hkdf.derive(get_master_key())
+
+def encrypt_bytes_for_user(user_id: int, data: bytes, aad: bytes = b"") -> bytes:
+    # MC1 | nonce(12) | AESGCM(ct+tag)
+    nonce = os.urandom(12)
+    ct = AESGCM(get_user_media_key(user_id)).encrypt(nonce, data, aad)
+    return b"MC1" + nonce + ct
+
+def decrypt_bytes_for_user(user_id: int, blob: bytes, aad: bytes = b"") -> bytes:
+    if not blob.startswith(b"MC1"):
+        raise ValueError("Encrypted header missing")
+    nonce = blob[3:15]
+    ct = blob[15:]
+    return AESGCM(get_user_media_key(user_id)).decrypt(nonce, ct, aad)
 
 # ================== Helpers ==================
 def current_user(request: Request) -> Optional[sqlite3.Row]:
@@ -500,6 +539,8 @@ async def add_security_headers(request: Request, call_next):
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Permissions-Policy"] = "geolocation=(), microphone=()"
+    resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+    resp.headers["Content-Security-Policy"] = "default-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: data:"
     return resp
 
 # ================== Routes ==================
@@ -686,18 +727,24 @@ async def upload(request: Request, files: list[UploadFile] = File(...), csrf_tok
         ext = Path(f.filename).suffix.lower()
         if ext not in IMAGE_EXTS | VIDEO_EXTS:
             continue
+
+        # RAM'de oku (AES-GCM stream desteği olmadığından)
+        raw = b""
+        written = 0
+        while True:
+            chunk = await f.read(1024 * 1024)
+            if not chunk: break
+            written += len(chunk)
+            if written > MAX_UPLOAD_MB * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="File too large")
+            raw += chunk
+
+        # ŞİFRELE & yaz
+        enc = encrypt_bytes_for_user(user["id"], raw, aad=f.filename.encode())
         new_name = f"{uuid.uuid4().hex}{ext}"
         dest = UPLOAD_DIR / new_name
-        written = 0
-        with dest.open("wb") as out:
-            while True:
-                chunk = await f.read(1024 * 1024)
-                if not chunk: break
-                written += len(chunk)
-                if written > MAX_UPLOAD_MB * 1024 * 1024:
-                    out.close(); dest.unlink(missing_ok=True)
-                    raise HTTPException(status_code=413, detail="File too large")
-                out.write(chunk)
+        dest.write_bytes(enc)
+
         media_type = guess_media_type(new_name)
         cur.execute("""INSERT INTO media(user_id, filename, original_name, media_type, uploaded_at)
                        VALUES (?,?,?,?,?)""",
@@ -740,17 +787,30 @@ async def reset_token(request: Request, csrf_token: str = Form("")):
     con.commit(); con.close()
     return PlainTextResponse(f"NEW DEVICE TOKEN (show once):\n{token_plain}")
 
-# ---- Panel içi medya (login gerekli)
+# ---- Şifreli dosyayı çözerek servis etme (panel & device)
+def _serve_decrypted_file(user_id: int, filename: str, original_name: str | None = None):
+    fp = UPLOAD_DIR / filename
+    if not fp.exists():
+        raise HTTPException(status_code=404)
+    size = fp.stat().st_size
+    if size > MAX_DECRYPT_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large to decrypt in-memory")
+    enc = fp.read_bytes()
+    try:
+        plain = decrypt_bytes_for_user(user_id, enc, aad=(original_name or filename).encode())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Corrupted or wrong key")
+    ctype = guess_media_type(original_name or filename)
+    return Response(content=plain, media_type=ctype)
+
 @app.get("/panel/media/{filename}")
 async def panel_media(filename: str, request: Request):
     user = require_login(request)
     con = db_conn(); cur = con.cursor()
-    cur.execute("SELECT 1 FROM media WHERE user_id=? AND filename=?", (user["id"], filename))
-    ok = cur.fetchone(); con.close()
-    if not ok: raise HTTPException(status_code=404)
-    fp = UPLOAD_DIR / filename
-    if not fp.exists(): raise HTTPException(status_code=404)
-    return FileResponse(fp)
+    cur.execute("SELECT original_name FROM media WHERE user_id=? AND filename=?", (user["id"], filename))
+    row = cur.fetchone(); con.close()
+    if not row: raise HTTPException(status_code=404)
+    return _serve_decrypted_file(user["id"], filename, row["original_name"])
 
 # ================== Device API ==================
 def _auth_bearer(request: Request) -> int:
@@ -769,8 +829,7 @@ async def api_playlist(request: Request):
     cur.execute("SELECT id, filename, media_type FROM media WHERE user_id=? ORDER BY uploaded_at ASC", (user_id,))
     rows = cur.fetchall()
     cur.execute("SELECT loop_all, shuffle, image_duration, video_repeats FROM config WHERE user_id=?", (user_id,))
-    cfg_row = cur.fetchone()
-    con.close()
+    cfg_row = cur.fetchone(); con.close()
     items = [{"id": r["id"], "url": f"/api/media/{r['filename']}", "media_type": r["media_type"], "filename": r["filename"]} for r in rows]
     cfg = {"loop_all": bool(cfg_row[0]) if cfg_row else True,
            "shuffle": bool(cfg_row[1]) if cfg_row else False,
@@ -782,16 +841,15 @@ async def api_playlist(request: Request):
 async def api_media(filename: str, request: Request):
     user_id = _auth_bearer(request)
     con = db_conn(); cur = con.cursor()
-    cur.execute("SELECT 1 FROM media WHERE user_id=? AND filename=?", (user_id, filename))
-    ok = cur.fetchone()
-    if ok:
+    cur.execute("SELECT original_name FROM media WHERE user_id=? AND filename=?", (user_id, filename))
+    row = cur.fetchone()
+    if row:
         cur.execute("UPDATE api_tokens SET last_used_at=? WHERE user_id=?",
                     (datetime.utcnow().isoformat(), user_id))
-    con.commit(); con.close()
-    if not ok: raise HTTPException(status_code=404)
-    fp = UPLOAD_DIR / filename
-    if not fp.exists(): raise HTTPException(status_code=404)
-    return FileResponse(fp)
+        con.commit()
+    con.close()
+    if not row: raise HTTPException(status_code=404)
+    return _serve_decrypted_file(user_id, filename, row["original_name"])
 
 # ================== Health ==================
 @app.get("/health")
