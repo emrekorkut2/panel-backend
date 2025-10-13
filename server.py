@@ -1,4 +1,3 @@
-# server.py
 import os
 import sqlite3
 import mimetypes
@@ -869,3 +868,4 @@ for name, content in {
     p = TEMPLATE_DIR / name
     if not p.exists():
         p.write_text(content, encoding="utf-8")
+
